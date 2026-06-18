@@ -30,6 +30,8 @@ def pd_control(target_q, q, kp, target_dq, dq, kd):
 
 
 PLATE_JOINT_ORDER = ("plate_x", "plate_y", "plate_z", "plate_roll", "plate_pitch", "plate_yaw")
+PLATE_BODY_PREFIX = "plate"
+PLATE_BODY_NAME = "plate"
 PLATE_GEOM_NAME = "plate_collision_0"
 PLATE_IMU_ACCEL_SENSOR = "plate_imu-accelerometer"
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -40,6 +42,7 @@ PLATE_SERVO_KV = np.array([10_000.0, 10_000.0, 10_000.0, 10_000.0, 10_000.0, 10_
 PLATE_SERVO_FORCE_LIMIT = np.array(
     [10_000_000.0, 10_000_000.0, 10_000_000.0, 10_000_000.0, 10_000_000.0, 10_000_000.0]
 )
+SAGITTAL_AXIS = 0
 
 
 def get_actuated_joint_addresses(model, num_actions):
@@ -85,13 +88,63 @@ def load_plate_motion(config):
         "amplitude": plate_array("amplitude", [0.0] * len(PLATE_JOINT_ORDER)),
         "period": period,
         "phase": plate_array("phase", [0.0] * len(PLATE_JOINT_ORDER)),
+        "sagittal_acceleration": load_sagittal_acceleration(motion),
     }
+
+
+def load_sagittal_acceleration(motion):
+    accel = motion.get("sagittal_acceleration", {})
+    ramp_duration = float(accel.get("ramp_duration", 0.0))
+    if ramp_duration < 0.0:
+        raise ValueError("plate_motion.sagittal_acceleration.ramp_duration must be non-negative")
+
+    return {
+        "enabled": bool(accel.get("enabled", False)),
+        "start_time": float(accel.get("start_time", motion.get("start_time", 0.0))),
+        "initial_acceleration": float(accel.get("initial_acceleration", 0.0)),
+        "target_acceleration": float(accel.get("target_acceleration", 0.0)),
+        "ramp_duration": ramp_duration,
+        "initial_velocity": float(accel.get("initial_velocity", 0.0)),
+    }
+
+
+def get_sagittal_acceleration_offset(t, sagittal_acceleration):
+    if not sagittal_acceleration["enabled"]:
+        return 0.0
+
+    t_eff = max(0.0, float(t) - sagittal_acceleration["start_time"])
+    if t_eff <= 0.0:
+        return 0.0
+
+    initial_accel = sagittal_acceleration["initial_acceleration"]
+    target_accel = sagittal_acceleration["target_acceleration"]
+    ramp_duration = sagittal_acceleration["ramp_duration"]
+    initial_velocity = sagittal_acceleration["initial_velocity"]
+
+    if ramp_duration <= 0.0:
+        return initial_velocity * t_eff + 0.5 * target_accel * t_eff**2
+
+    if t_eff <= ramp_duration:
+        accel_delta = target_accel - initial_accel
+        return initial_velocity * t_eff + 0.5 * initial_accel * t_eff**2 + accel_delta * t_eff**3 / (6.0 * ramp_duration)
+
+    accel_delta = target_accel - initial_accel
+    ramp_pos = (
+        initial_velocity * ramp_duration
+        + 0.5 * initial_accel * ramp_duration**2
+        + accel_delta * ramp_duration**2 / 6.0
+    )
+    ramp_vel = initial_velocity + initial_accel * ramp_duration + 0.5 * accel_delta * ramp_duration
+    post_ramp_t = t_eff - ramp_duration
+    return ramp_pos + ramp_vel * post_ramp_t + 0.5 * target_accel * post_ramp_t**2
 
 
 def get_plate_command(t, plate_motion):
     t_eff = max(0.0, float(t) - plate_motion["start_time"])
     phase = 2.0 * np.pi * t_eff / plate_motion["period"] + plate_motion["phase"]
-    return plate_motion["offset"] + plate_motion["amplitude"] * (1.0 - np.cos(phase))
+    command = plate_motion["offset"] + plate_motion["amplitude"] * (1.0 - np.cos(phase))
+    command[SAGITTAL_AXIS] += get_sagittal_acceleration_offset(t, plate_motion["sagittal_acceleration"])
+    return command
 
 
 def get_plate_joint_addresses(model, require_plate):
@@ -112,6 +165,20 @@ def get_plate_joint_addresses(model, require_plate):
         return None
 
     return np.array(qpos_addr, dtype=np.int32), np.array(dof_addr, dtype=np.int32)
+
+
+def get_robot_body_ids(model):
+    body_ids = []
+    for body_id in range(1, model.nbody):
+        body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id) or ""
+        if body_name.startswith(PLATE_BODY_PREFIX):
+            continue
+        if model.body_mass[body_id] > 0.0:
+            body_ids.append(body_id)
+
+    if not body_ids:
+        raise RuntimeError("No robot bodies with mass were found for COM logging")
+    return np.array(body_ids, dtype=np.int32)
 
 
 def configure_plate_model(model, plate_motion):
@@ -158,10 +225,21 @@ class PlateDataLogger:
     def __init__(self, model, plate_addresses, output_dir=DATA_DIR):
         self.output_dir = Path(output_dir)
         self.plate_addresses = plate_addresses
+        self.robot_body_ids = get_robot_body_ids(model)
+        self.robot_body_masses = model.body_mass[self.robot_body_ids].astype(np.float64)
+        self.robot_body_mass = float(np.sum(self.robot_body_masses))
+        self.plate_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, PLATE_BODY_NAME)
+        self.prev_t = None
+        self.prev_com_pos = None
+        self.prev_plate_pos = None
+
         self.t = []
         self.plate_imu_acc = []
         self.drs_des = []
         self.drs_act = []
+        self.com_vel_plate = []
+        self.cmd_vel = []
+        self.com_vel_tracking_error = []
 
         self.plate_imu_acc_sid = mujoco.mj_name2id(
             model, mujoco.mjtObj.mjOBJ_SENSOR, PLATE_IMU_ACCEL_SENSOR
@@ -173,9 +251,10 @@ class PlateDataLogger:
             self.plate_imu_acc_adr = -1
             self.plate_imu_acc_dim = 0
 
-    def update(self, data, t, plate_command=None):
+    def update(self, data, t, plate_command=None, cmd=None):
         self.t.append([float(t)])
         self.plate_imu_acc.append(self._read_plate_imu_acc(data))
+        com_vel_plate = self._read_com_velocity_in_plate_frame(data, t)
 
         if plate_command is None:
             plate_command = np.zeros(len(PLATE_JOINT_ORDER), dtype=np.float32)
@@ -188,12 +267,28 @@ class PlateDataLogger:
             plate_state = data.qpos[plate_qpos_addr].astype(np.float32)
         self.drs_act.append(plate_state)
 
+        if cmd is None:
+            cmd_vel = np.zeros(2, dtype=np.float32)
+        else:
+            cmd_vel = np.asarray(cmd, dtype=np.float32).reshape(-1)[:2]
+        tracking_error_xy = cmd_vel - com_vel_plate[:2]
+        tracking_error = np.array(
+            [tracking_error_xy[0], tracking_error_xy[1], np.linalg.norm(tracking_error_xy)],
+            dtype=np.float32,
+        )
+        self.com_vel_plate.append(com_vel_plate)
+        self.cmd_vel.append(cmd_vel)
+        self.com_vel_tracking_error.append(tracking_error)
+
     def save(self):
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._save_array("t", self.t, 1)
         self._save_array("plate_imu_acc", self.plate_imu_acc, 3)
         self._save_array("drs_des", self.drs_des, len(PLATE_JOINT_ORDER))
         self._save_array("drs_act", self.drs_act, len(PLATE_JOINT_ORDER))
+        self._save_array("com_vel_plate", self.com_vel_plate, 3)
+        self._save_array("cmd_vel", self.cmd_vel, 2)
+        self._save_array("com_vel_tracking_error", self.com_vel_tracking_error, 3)
         print(f"Saved MuJoCo deploy data to {self.output_dir}")
 
     def _read_plate_imu_acc(self, data):
@@ -201,6 +296,38 @@ class PlateDataLogger:
             return np.zeros(3, dtype=np.float32)
         acc = data.sensordata[self.plate_imu_acc_adr : self.plate_imu_acc_adr + 3]
         return np.asarray(acc, dtype=np.float32).reshape(3)
+
+    def _read_com_velocity_in_plate_frame(self, data, t):
+        com_pos = self._read_robot_com_position(data)
+        plate_pos, plate_rot = self._read_plate_pose(data)
+
+        if self.prev_t is None:
+            com_vel_plate = np.zeros(3, dtype=np.float32)
+        else:
+            dt = float(t) - self.prev_t
+            if dt <= 0.0:
+                com_vel_plate = np.zeros(3, dtype=np.float32)
+            else:
+                com_vel_world = (com_pos - self.prev_com_pos) / dt
+                plate_vel_world = (plate_pos - self.prev_plate_pos) / dt
+                com_vel_plate = plate_rot.T @ (com_vel_world - plate_vel_world)
+                com_vel_plate = com_vel_plate.astype(np.float32)
+
+        self.prev_t = float(t)
+        self.prev_com_pos = com_pos
+        self.prev_plate_pos = plate_pos
+        return com_vel_plate
+
+    def _read_robot_com_position(self, data):
+        body_com_positions = data.xipos[self.robot_body_ids]
+        return np.sum(body_com_positions * self.robot_body_masses[:, None], axis=0) / self.robot_body_mass
+
+    def _read_plate_pose(self, data):
+        if self.plate_body_id < 0:
+            return np.zeros(3, dtype=np.float64), np.eye(3, dtype=np.float64)
+        plate_pos = np.asarray(data.xpos[self.plate_body_id], dtype=np.float64)
+        plate_rot = np.asarray(data.xmat[self.plate_body_id], dtype=np.float64).reshape(3, 3)
+        return plate_pos, plate_rot
 
     def _save_array(self, name, values, width):
         if values:
@@ -290,7 +417,7 @@ if __name__ == "__main__":
                 # mj_step can be replaced with code that also evaluates
                 # a policy and applies a control signal before stepping the physics.
                 mujoco.mj_step(m, d)
-                data_logger.update(d, d.time, plate_command)
+                data_logger.update(d, d.time, plate_command, cmd)
 
                 counter += 1
                 if counter % control_decimation == 0:

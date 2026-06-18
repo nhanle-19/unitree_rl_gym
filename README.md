@@ -36,6 +36,13 @@ plate_motion:
   amplitude: [0.10, 0.0, 0.0, 0.02618, 0.02618, 0.0]
   period: [4.5, 4.5, 5.0, 4.5, 4.5, 4.5]
   phase: [0.0, 0.785398, 0.349066, 0.523599, 0.0, 0.0]
+  sagittal_acceleration:
+    enabled: false
+    start_time: 0.0
+    initial_acceleration: 0.0
+    target_acceleration: 0.1
+    ramp_duration: 2.0
+    initial_velocity: 0.0
 ```
 
 Values are ordered as:
@@ -50,6 +57,8 @@ Linear channels are in meters, angular channels are in radians. Each channel fol
 offset + amplitude * (1 - cos(2*pi*t/period + phase))
 ```
 
+The optional `sagittal_acceleration` block adds an x-axis displacement to the plate command by integrating acceleration. During `ramp_duration`, acceleration ramps linearly from `initial_acceleration` to `target_acceleration`; after that, the plate continues with constant `target_acceleration`. Acceleration is in `m/s^2`, velocity is in `m/s`, and time is in seconds.
+
 Useful tweaks:
 
 - Set `enabled: false` to stop the plate servo command.
@@ -57,6 +66,7 @@ Useful tweaks:
 - Increase `amplitude[3]` or `amplitude[4]` for roll/pitch tilt.
 - Increase `period` for slower motion; decrease it for faster motion.
 - Set `start_time` to delay when the moving plate begins.
+- Set `sagittal_acceleration.enabled: true` for ramped constant acceleration along plate x.
 
 ## Log and Plot Plate IMU
 
@@ -72,6 +82,14 @@ The first plotted signal is the plate IMU accelerometer:
 deploy/deploy_mujoco/data/plate_imu_acc.dat
 ```
 
+The deploy run also logs COM velocity tracking data in the plate frame:
+
+```text
+deploy/deploy_mujoco/data/com_vel_plate.dat
+deploy/deploy_mujoco/data/cmd_vel.dat
+deploy/deploy_mujoco/data/com_vel_tracking_error.dat
+```
+
 Run the plotter after a deploy run:
 
 ```bash
@@ -82,9 +100,10 @@ This saves:
 
 ```text
 deploy/deploy_mujoco/data/plate_imu_acc.png
+deploy/deploy_mujoco/data/com_velocity_tracking_error.png
 ```
 
-Use `--show` to also open the matplotlib window.
+Use `--plot com-velocity-tracking` to generate only the COM velocity tracking plot, and use `--show` to also open the matplotlib window.
 
 ## Notes
 
