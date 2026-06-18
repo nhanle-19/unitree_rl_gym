@@ -35,6 +35,12 @@ PLATE_BODY_NAME = "plate"
 PLATE_GEOM_NAME = "plate_collision_0"
 PLATE_IMU_ACCEL_SENSOR = "plate_imu-accelerometer"
 DATA_DIR = Path(__file__).resolve().parent / "data"
+DEFAULT_VIEWER_CAMERA = {
+    "track_base": True,
+    "distance": 3.0,
+    "azimuth": -140.0,
+    "elevation": -20.0,
+}
 PLATE_SERVO_KP = np.array(
     [1_000_000.0, 1_000_000.0, 1_000_000.0, 3_000_000.0, 3_000_000.0, 3_000_000.0]
 )
@@ -64,6 +70,12 @@ def get_actuated_joint_addresses(model, num_actions):
         dof_addr.append(dadr)
 
     return np.array(qpos_addr, dtype=np.int32), np.array(dof_addr, dtype=np.int32)
+
+
+def load_viewer_camera(config):
+    camera = DEFAULT_VIEWER_CAMERA.copy()
+    camera.update(config.get("viewer_camera", {}))
+    return camera
 
 
 def load_plate_motion(config):
@@ -179,6 +191,28 @@ def get_robot_body_ids(model):
     if not body_ids:
         raise RuntimeError("No robot bodies with mass were found for COM logging")
     return np.array(body_ids, dtype=np.int32)
+
+
+def get_base_body_id(model):
+    for joint_id in range(model.njnt):
+        if model.jnt_type[joint_id] == mujoco.mjtJoint.mjJNT_FREE:
+            return int(model.jnt_bodyid[joint_id])
+
+    for body_id in get_robot_body_ids(model):
+        return int(body_id)
+
+    raise RuntimeError("No robot base body was found for viewer tracking")
+
+
+def configure_viewer_camera(viewer, model, camera_config):
+    if not camera_config["track_base"]:
+        return
+
+    viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+    viewer.cam.trackbodyid = get_base_body_id(model)
+    viewer.cam.distance = float(camera_config["distance"])
+    viewer.cam.azimuth = float(camera_config["azimuth"])
+    viewer.cam.elevation = float(camera_config["elevation"])
 
 
 def configure_plate_model(model, plate_motion):
@@ -370,6 +404,7 @@ if __name__ == "__main__":
         
         cmd = np.array(config["cmd_init"], dtype=np.float32)
         plate_motion = load_plate_motion(config)
+        viewer_camera = load_viewer_camera(config)
 
     # define context variables
     action = np.zeros(num_actions, dtype=np.float32)
@@ -394,6 +429,7 @@ if __name__ == "__main__":
 
     try:
         with mujoco.viewer.launch_passive(m, d) as viewer:
+            configure_viewer_camera(viewer, m, viewer_camera)
             # Close the viewer automatically after simulation_duration wall-seconds.
             start = time.time()
             while viewer.is_running() and time.time() - start < simulation_duration:

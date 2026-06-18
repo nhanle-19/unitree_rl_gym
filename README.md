@@ -24,6 +24,20 @@ The scene with the plate lives at:
 resources/robots/g1_description/scene.xml
 ```
 
+## Tune Viewer Camera
+
+By default, the MuJoCo viewer tracks the robot base body, so the view follows the robot like the Digit viewer:
+
+```yaml
+viewer_camera:
+  track_base: true
+  distance: 3.0
+  azimuth: -140.0
+  elevation: -20.0
+```
+
+Set `track_base: false` to leave the viewer camera in the normal free-camera mode.
+
 ## Tune Plate Motion
 
 Edit `plate_motion` in `deploy/deploy_mujoco/configs/g1.yaml`:
