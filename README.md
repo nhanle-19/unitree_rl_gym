@@ -6,7 +6,7 @@ For installation, training, export, Sim2Real, and the normal Unitree RL Gym work
 ## Run G1 on the Moving Plate
 
 The G1 MuJoCo scene includes a HumanUp-style 6-DOF support plate. The normal floor is visual-only, so the robot contacts the plate instead of walking on the flat MuJoCo plane.
-The visual checker ground is lowered below the plate so the moving support is easy to see in the viewer.
+The visual checker ground is lowered 1 m below the plate so the moving support is easy to see in the viewer.
 
 ```bash
 python deploy/deploy_mujoco/deploy_mujoco.py g1.yaml
