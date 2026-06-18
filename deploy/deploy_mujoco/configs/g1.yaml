@@ -24,3 +24,14 @@ num_actions: 12
 num_obs: 47
 
 cmd_init: [0.5, 0, 0]
+
+# HumanUp-style 6-DOF moving support plate.
+# Order is [x, y, z, roll, pitch, yaw]; linear values are meters, angular values are radians.
+# Each channel uses: offset + amplitude * (1 - cos(2*pi*t/period + phase)).
+plate_motion:
+  enabled: true
+  start_time: 0.0
+  offset: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  amplitude: [0.10, 0.0, 0.0, 0.02618, 0.02618, 0.0]
+  period: [4.5, 4.5, 5.0, 4.5, 4.5, 4.5]
+  phase: [0.0, 0.785398, 0.349066, 0.523599, 0.0, 0.0]

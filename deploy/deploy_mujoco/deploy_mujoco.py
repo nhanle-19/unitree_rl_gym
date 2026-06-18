@@ -28,6 +28,129 @@ def pd_control(target_q, q, kp, target_dq, dq, kd):
     return (target_q - q) * kp + (target_dq - dq) * kd
 
 
+PLATE_JOINT_ORDER = ("plate_x", "plate_y", "plate_z", "plate_roll", "plate_pitch", "plate_yaw")
+PLATE_GEOM_NAME = "plate_collision_0"
+PLATE_SERVO_KP = np.array(
+    [1_000_000.0, 1_000_000.0, 1_000_000.0, 3_000_000.0, 3_000_000.0, 3_000_000.0]
+)
+PLATE_SERVO_KV = np.array([10_000.0, 10_000.0, 10_000.0, 10_000.0, 10_000.0, 10_000.0])
+PLATE_SERVO_FORCE_LIMIT = np.array(
+    [10_000_000.0, 10_000_000.0, 10_000_000.0, 10_000_000.0, 10_000_000.0, 10_000_000.0]
+)
+
+
+def get_actuated_joint_addresses(model, num_actions):
+    if model.nu < num_actions:
+        raise RuntimeError(f"Model has {model.nu} actuators, but config expects {num_actions} actions")
+
+    qpos_addr = []
+    dof_addr = []
+    for actuator_id in range(num_actions):
+        joint_id = int(model.actuator_trnid[actuator_id, 0])
+        if joint_id < 0:
+            raise RuntimeError(f"Actuator {actuator_id} is not attached to a joint")
+        qadr = int(model.jnt_qposadr[joint_id])
+        dadr = int(model.jnt_dofadr[joint_id])
+        if qadr < 0 or dadr < 0:
+            joint_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
+            raise RuntimeError(f"Actuated joint {joint_name!r} does not expose qpos/qvel addresses")
+        qpos_addr.append(qadr)
+        dof_addr.append(dadr)
+
+    return np.array(qpos_addr, dtype=np.int32), np.array(dof_addr, dtype=np.int32)
+
+
+def load_plate_motion(config):
+    motion = config.get("plate_motion", {})
+    enabled = bool(motion.get("enabled", False))
+
+    def plate_array(key, default):
+        value = motion.get(key, default)
+        array = np.array(value, dtype=np.float64)
+        if array.shape != (len(PLATE_JOINT_ORDER),):
+            raise ValueError(f"plate_motion.{key} must have {len(PLATE_JOINT_ORDER)} values")
+        return array
+
+    period = plate_array("period", [4.5, 4.5, 5.0, 4.5, 4.5, 4.5])
+    if np.any(period <= 0.0):
+        raise ValueError("plate_motion.period values must be positive")
+
+    return {
+        "enabled": enabled,
+        "start_time": float(motion.get("start_time", 0.0)),
+        "offset": plate_array("offset", [0.0] * len(PLATE_JOINT_ORDER)),
+        "amplitude": plate_array("amplitude", [0.0] * len(PLATE_JOINT_ORDER)),
+        "period": period,
+        "phase": plate_array("phase", [0.0] * len(PLATE_JOINT_ORDER)),
+    }
+
+
+def get_plate_command(t, plate_motion):
+    t_eff = max(0.0, float(t) - plate_motion["start_time"])
+    phase = 2.0 * np.pi * t_eff / plate_motion["period"] + plate_motion["phase"]
+    return plate_motion["offset"] + plate_motion["amplitude"] * (1.0 - np.cos(phase))
+
+
+def get_plate_joint_addresses(model, require_plate):
+    qpos_addr = []
+    dof_addr = []
+    missing = []
+    for name in PLATE_JOINT_ORDER:
+        joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+        if joint_id == -1:
+            missing.append(name)
+            continue
+        qpos_addr.append(int(model.jnt_qposadr[joint_id]))
+        dof_addr.append(int(model.jnt_dofadr[joint_id]))
+
+    if missing:
+        if require_plate:
+            raise RuntimeError(f"Plate motion is enabled, but these plate joints are missing: {missing}")
+        return None
+
+    return np.array(qpos_addr, dtype=np.int32), np.array(dof_addr, dtype=np.int32)
+
+
+def configure_plate_model(model, plate_motion):
+    plate_addresses = get_plate_joint_addresses(model, plate_motion["enabled"])
+    if plate_addresses is None:
+        return None
+
+    plate_geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, PLATE_GEOM_NAME)
+    if plate_geom_id == -1 and plate_motion["enabled"]:
+        raise RuntimeError(f"Plate motion is enabled, but geom {PLATE_GEOM_NAME!r} is missing")
+    if plate_geom_id != -1:
+        model.geom_friction[plate_geom_id] = [2.5, 0.005, 0.0001]
+        model.geom_condim[plate_geom_id] = 4
+        model.geom_contype[plate_geom_id] = 128
+        model.geom_conaffinity[plate_geom_id] = 5
+        model.geom_priority[plate_geom_id] = 100
+        model.geom_margin[plate_geom_id] = 0.002
+        model.geom_solref[plate_geom_id] = [0.002, 1.0]
+        model.geom_solimp[plate_geom_id] = [0.95, 0.99, 0.001, 0.5, 2.0]
+
+    _, plate_dof_addr = plate_addresses
+    model.dof_armature[plate_dof_addr] = 10.0
+    model.dof_damping[plate_dof_addr] = [100.0, 100.0, 100.0, 100.0, 100.0, 100.0]
+    model.dof_frictionloss[plate_dof_addr] = [10.0, 10.0, 10.0, 10.0, 10.0, 10.0]
+    return plate_addresses
+
+
+def apply_plate_state(data, plate_addresses, plate_command):
+    plate_qpos_addr, plate_dof_addr = plate_addresses
+    data.qpos[plate_qpos_addr] = plate_command
+    data.qvel[plate_dof_addr] = 0.0
+
+
+def apply_plate_position_control(data, plate_addresses, plate_command):
+    plate_qpos_addr, plate_dof_addr = plate_addresses
+    force = (
+        PLATE_SERVO_KP * (plate_command - data.qpos[plate_qpos_addr])
+        - PLATE_SERVO_KV * data.qvel[plate_dof_addr]
+    )
+    data.qfrc_applied[plate_dof_addr] = np.clip(force, -PLATE_SERVO_FORCE_LIMIT, PLATE_SERVO_FORCE_LIMIT)
+
+
 if __name__ == "__main__":
     # get config file name from command line
     import argparse
@@ -60,6 +183,7 @@ if __name__ == "__main__":
         num_obs = config["num_obs"]
         
         cmd = np.array(config["cmd_init"], dtype=np.float32)
+        plate_motion = load_plate_motion(config)
 
     # define context variables
     action = np.zeros(num_actions, dtype=np.float32)
@@ -72,6 +196,11 @@ if __name__ == "__main__":
     m = mujoco.MjModel.from_xml_path(xml_path)
     d = mujoco.MjData(m)
     m.opt.timestep = simulation_dt
+    robot_qpos_addr, robot_dof_addr = get_actuated_joint_addresses(m, num_actions)
+    plate_addresses = configure_plate_model(m, plate_motion)
+    if plate_motion["enabled"]:
+        apply_plate_state(d, plate_addresses, get_plate_command(0.0, plate_motion))
+        mujoco.mj_forward(m, d)
 
     # load policy
     policy = torch.jit.load(policy_path)
@@ -81,8 +210,20 @@ if __name__ == "__main__":
         start = time.time()
         while viewer.is_running() and time.time() - start < simulation_duration:
             step_start = time.time()
-            tau = pd_control(target_dof_pos, d.qpos[7:], kps, np.zeros_like(kds), d.qvel[6:], kds)
-            d.ctrl[:] = tau
+            sim_time = counter * simulation_dt
+            if plate_motion["enabled"]:
+                plate_command = get_plate_command(sim_time, plate_motion)
+                apply_plate_position_control(d, plate_addresses, plate_command)
+
+            tau = pd_control(
+                target_dof_pos,
+                d.qpos[robot_qpos_addr],
+                kps,
+                np.zeros_like(kds),
+                d.qvel[robot_dof_addr],
+                kds,
+            )
+            d.ctrl[:num_actions] = tau
             # mj_step can be replaced with code that also evaluates
             # a policy and applies a control signal before stepping the physics.
             mujoco.mj_step(m, d)
@@ -92,8 +233,8 @@ if __name__ == "__main__":
                 # Apply control signal here.
 
                 # create observation
-                qj = d.qpos[7:]
-                dqj = d.qvel[6:]
+                qj = d.qpos[robot_qpos_addr]
+                dqj = d.qvel[robot_dof_addr]
                 quat = d.qpos[3:7]
                 omega = d.qvel[3:6]
 

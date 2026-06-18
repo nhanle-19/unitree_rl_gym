@@ -13,10 +13,50 @@
     <texture type="skybox" builtin="flat" rgb1="0 0 0" rgb2="0 0 0" width="512" height="3072"/>
     <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300"/>
     <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+    <material name="plate_gray" rgba="0.8 0.8 0.8 1"/>
   </asset>
 
   <worldbody>
     <light pos="1 0 3.5" dir="0 0 -1" directional="true"/>
-    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" contype="0" conaffinity="0"/>
+    <body name="plate_x_link">
+      <inertial pos="0 0 0" mass="0.001" diaginertia="1e-7 1e-7 1e-7"/>
+      <joint name="plate_x" type="slide" axis="1 0 0" range="-1000 1000" damping="100" frictionloss="0"/>
+      <body name="plate_y_link">
+        <inertial pos="0 0 0" mass="0.001" diaginertia="1e-7 1e-7 1e-7"/>
+        <joint name="plate_y" type="slide" axis="0 1 0" range="-1000 1000" damping="100" frictionloss="10"/>
+        <body name="plate_z_link">
+          <inertial pos="0 0 0" mass="0.001" diaginertia="1e-7 1e-7 1e-7"/>
+          <joint name="plate_z" type="slide" axis="0 0 1" range="0 4.001" damping="100" frictionloss="10"/>
+          <body name="plate_roll_link">
+            <inertial pos="0 0 0" mass="0.001" diaginertia="1e-7 1e-7 1e-7"/>
+            <joint name="plate_roll" type="hinge" axis="1 0 0" damping="100" frictionloss="10"/>
+            <body name="plate_pitch_link">
+              <inertial pos="0 0 0" mass="0.001" diaginertia="1e-7 1e-7 1e-7"/>
+              <joint name="plate_pitch" type="hinge" axis="0 1 0" damping="500" frictionloss="10"/>
+              <body name="plate">
+                <inertial pos="0 0 0" mass="50000" diaginertia="16667.083333333332 10416666.666666666 10433333.333333332"/>
+                <joint name="plate_yaw" type="hinge" axis="0 0 1" damping="100" frictionloss="10"/>
+                <geom
+                  name="plate_collision_0"
+                  pos="0 0 -0.2"
+                  size="7 7 0.2"
+                  type="box"
+                  material="plate_gray"
+                  friction="2.5 0.005 0.0001"
+                  condim="4"
+                  contype="128"
+                  conaffinity="5"
+                  priority="100"
+                  margin="0.002"
+                  solref="0.002 1.0"
+                  solimp="0.95 0.99 0.001 0.5 2.0"
+                />
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
   </worldbody>
 </mujoco>
