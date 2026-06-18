@@ -37,6 +37,7 @@
               <body name="plate">
                 <inertial pos="0 0 0" mass="50000" diaginertia="16667.083333333332 10416666.666666666 10433333.333333332"/>
                 <joint name="plate_yaw" type="hinge" axis="0 0 1" damping="100" frictionloss="10"/>
+                <site name="plate_imu" pos="0 0 0" quat="1 0 0 0"/>
                 <geom
                   name="plate_collision_0"
                   pos="0 0 -0.2"
@@ -59,4 +60,8 @@
       </body>
     </body>
   </worldbody>
+  <sensor>
+    <accelerometer name="plate_imu-accelerometer" site="plate_imu" cutoff="157" noise="0"/>
+    <framequat name="plate_imu-orientation" objtype="site" objname="plate_imu"/>
+  </sensor>
 </mujoco>

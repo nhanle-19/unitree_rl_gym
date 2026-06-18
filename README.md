@@ -58,6 +58,34 @@ Useful tweaks:
 - Increase `period` for slower motion; decrease it for faster motion.
 - Set `start_time` to delay when the moving plate begins.
 
+## Log and Plot Plate IMU
+
+`deploy_mujoco.py` logs plate data to:
+
+```text
+deploy/deploy_mujoco/data
+```
+
+The first plotted signal is the plate IMU accelerometer:
+
+```text
+deploy/deploy_mujoco/data/plate_imu_acc.dat
+```
+
+Run the plotter after a deploy run:
+
+```bash
+python deploy/deploy_mujoco/plot_data.py
+```
+
+This saves:
+
+```text
+deploy/deploy_mujoco/data/plate_imu_acc.png
+```
+
+Use `--show` to also open the matplotlib window.
+
 ## Notes
 
 - `deploy_mujoco.py` reads robot joint state through the actuated joint addresses, so the extra plate joints do not enter the policy observation.

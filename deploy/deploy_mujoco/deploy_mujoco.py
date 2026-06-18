@@ -1,4 +1,5 @@
 import time
+from pathlib import Path
 
 import mujoco.viewer
 import mujoco
@@ -30,6 +31,8 @@ def pd_control(target_q, q, kp, target_dq, dq, kd):
 
 PLATE_JOINT_ORDER = ("plate_x", "plate_y", "plate_z", "plate_roll", "plate_pitch", "plate_yaw")
 PLATE_GEOM_NAME = "plate_collision_0"
+PLATE_IMU_ACCEL_SENSOR = "plate_imu-accelerometer"
+DATA_DIR = Path(__file__).resolve().parent / "data"
 PLATE_SERVO_KP = np.array(
     [1_000_000.0, 1_000_000.0, 1_000_000.0, 3_000_000.0, 3_000_000.0, 3_000_000.0]
 )
@@ -151,6 +154,62 @@ def apply_plate_position_control(data, plate_addresses, plate_command):
     data.qfrc_applied[plate_dof_addr] = np.clip(force, -PLATE_SERVO_FORCE_LIMIT, PLATE_SERVO_FORCE_LIMIT)
 
 
+class PlateDataLogger:
+    def __init__(self, model, plate_addresses, output_dir=DATA_DIR):
+        self.output_dir = Path(output_dir)
+        self.plate_addresses = plate_addresses
+        self.t = []
+        self.plate_imu_acc = []
+        self.drs_des = []
+        self.drs_act = []
+
+        self.plate_imu_acc_sid = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_SENSOR, PLATE_IMU_ACCEL_SENSOR
+        )
+        if self.plate_imu_acc_sid >= 0:
+            self.plate_imu_acc_adr = int(model.sensor_adr[self.plate_imu_acc_sid])
+            self.plate_imu_acc_dim = int(model.sensor_dim[self.plate_imu_acc_sid])
+        else:
+            self.plate_imu_acc_adr = -1
+            self.plate_imu_acc_dim = 0
+
+    def update(self, data, t, plate_command=None):
+        self.t.append([float(t)])
+        self.plate_imu_acc.append(self._read_plate_imu_acc(data))
+
+        if plate_command is None:
+            plate_command = np.zeros(len(PLATE_JOINT_ORDER), dtype=np.float32)
+        self.drs_des.append(np.asarray(plate_command, dtype=np.float32).reshape(len(PLATE_JOINT_ORDER)))
+
+        if self.plate_addresses is None:
+            plate_state = np.zeros(len(PLATE_JOINT_ORDER), dtype=np.float32)
+        else:
+            plate_qpos_addr, _ = self.plate_addresses
+            plate_state = data.qpos[plate_qpos_addr].astype(np.float32)
+        self.drs_act.append(plate_state)
+
+    def save(self):
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._save_array("t", self.t, 1)
+        self._save_array("plate_imu_acc", self.plate_imu_acc, 3)
+        self._save_array("drs_des", self.drs_des, len(PLATE_JOINT_ORDER))
+        self._save_array("drs_act", self.drs_act, len(PLATE_JOINT_ORDER))
+        print(f"Saved MuJoCo deploy data to {self.output_dir}")
+
+    def _read_plate_imu_acc(self, data):
+        if self.plate_imu_acc_sid < 0 or self.plate_imu_acc_dim < 3:
+            return np.zeros(3, dtype=np.float32)
+        acc = data.sensordata[self.plate_imu_acc_adr : self.plate_imu_acc_adr + 3]
+        return np.asarray(acc, dtype=np.float32).reshape(3)
+
+    def _save_array(self, name, values, width):
+        if values:
+            array = np.asarray(values, dtype=np.float32).reshape(-1, width)
+        else:
+            array = np.empty((0, width), dtype=np.float32)
+        np.savetxt(self.output_dir / f"{name}.dat", array)
+
+
 if __name__ == "__main__":
     # get config file name from command line
     import argparse
@@ -201,71 +260,78 @@ if __name__ == "__main__":
     if plate_motion["enabled"]:
         apply_plate_state(d, plate_addresses, get_plate_command(0.0, plate_motion))
         mujoco.mj_forward(m, d)
+    data_logger = PlateDataLogger(m, plate_addresses)
 
     # load policy
     policy = torch.jit.load(policy_path)
 
-    with mujoco.viewer.launch_passive(m, d) as viewer:
-        # Close the viewer automatically after simulation_duration wall-seconds.
-        start = time.time()
-        while viewer.is_running() and time.time() - start < simulation_duration:
-            step_start = time.time()
-            sim_time = counter * simulation_dt
-            if plate_motion["enabled"]:
-                plate_command = get_plate_command(sim_time, plate_motion)
-                apply_plate_position_control(d, plate_addresses, plate_command)
+    try:
+        with mujoco.viewer.launch_passive(m, d) as viewer:
+            # Close the viewer automatically after simulation_duration wall-seconds.
+            start = time.time()
+            while viewer.is_running() and time.time() - start < simulation_duration:
+                step_start = time.time()
+                sim_time = counter * simulation_dt
+                if plate_motion["enabled"]:
+                    plate_command = get_plate_command(sim_time, plate_motion)
+                    apply_plate_position_control(d, plate_addresses, plate_command)
+                else:
+                    plate_command = np.zeros(len(PLATE_JOINT_ORDER), dtype=np.float64)
 
-            tau = pd_control(
-                target_dof_pos,
-                d.qpos[robot_qpos_addr],
-                kps,
-                np.zeros_like(kds),
-                d.qvel[robot_dof_addr],
-                kds,
-            )
-            d.ctrl[:num_actions] = tau
-            # mj_step can be replaced with code that also evaluates
-            # a policy and applies a control signal before stepping the physics.
-            mujoco.mj_step(m, d)
+                tau = pd_control(
+                    target_dof_pos,
+                    d.qpos[robot_qpos_addr],
+                    kps,
+                    np.zeros_like(kds),
+                    d.qvel[robot_dof_addr],
+                    kds,
+                )
+                d.ctrl[:num_actions] = tau
+                # mj_step can be replaced with code that also evaluates
+                # a policy and applies a control signal before stepping the physics.
+                mujoco.mj_step(m, d)
+                data_logger.update(d, d.time, plate_command)
 
-            counter += 1
-            if counter % control_decimation == 0:
-                # Apply control signal here.
+                counter += 1
+                if counter % control_decimation == 0:
+                    # Apply control signal here.
 
-                # create observation
-                qj = d.qpos[robot_qpos_addr]
-                dqj = d.qvel[robot_dof_addr]
-                quat = d.qpos[3:7]
-                omega = d.qvel[3:6]
+                    # create observation
+                    qj = d.qpos[robot_qpos_addr]
+                    dqj = d.qvel[robot_dof_addr]
+                    quat = d.qpos[3:7]
+                    omega = d.qvel[3:6]
 
-                qj = (qj - default_angles) * dof_pos_scale
-                dqj = dqj * dof_vel_scale
-                gravity_orientation = get_gravity_orientation(quat)
-                omega = omega * ang_vel_scale
+                    qj = (qj - default_angles) * dof_pos_scale
+                    dqj = dqj * dof_vel_scale
+                    gravity_orientation = get_gravity_orientation(quat)
+                    omega = omega * ang_vel_scale
 
-                period = 0.8
-                count = counter * simulation_dt
-                phase = count % period / period
-                sin_phase = np.sin(2 * np.pi * phase)
-                cos_phase = np.cos(2 * np.pi * phase)
+                    period = 0.8
+                    count = counter * simulation_dt
+                    phase = count % period / period
+                    sin_phase = np.sin(2 * np.pi * phase)
+                    cos_phase = np.cos(2 * np.pi * phase)
 
-                obs[:3] = omega
-                obs[3:6] = gravity_orientation
-                obs[6:9] = cmd * cmd_scale
-                obs[9 : 9 + num_actions] = qj
-                obs[9 + num_actions : 9 + 2 * num_actions] = dqj
-                obs[9 + 2 * num_actions : 9 + 3 * num_actions] = action
-                obs[9 + 3 * num_actions : 9 + 3 * num_actions + 2] = np.array([sin_phase, cos_phase])
-                obs_tensor = torch.from_numpy(obs).unsqueeze(0)
-                # policy inference
-                action = policy(obs_tensor).detach().numpy().squeeze()
-                # transform action to target_dof_pos
-                target_dof_pos = action * action_scale + default_angles
+                    obs[:3] = omega
+                    obs[3:6] = gravity_orientation
+                    obs[6:9] = cmd * cmd_scale
+                    obs[9 : 9 + num_actions] = qj
+                    obs[9 + num_actions : 9 + 2 * num_actions] = dqj
+                    obs[9 + 2 * num_actions : 9 + 3 * num_actions] = action
+                    obs[9 + 3 * num_actions : 9 + 3 * num_actions + 2] = np.array([sin_phase, cos_phase])
+                    obs_tensor = torch.from_numpy(obs).unsqueeze(0)
+                    # policy inference
+                    action = policy(obs_tensor).detach().numpy().squeeze()
+                    # transform action to target_dof_pos
+                    target_dof_pos = action * action_scale + default_angles
 
-            # Pick up changes to the physics state, apply perturbations, update options from GUI.
-            viewer.sync()
+                # Pick up changes to the physics state, apply perturbations, update options from GUI.
+                viewer.sync()
 
-            # Rudimentary time keeping, will drift relative to wall clock.
-            time_until_next_step = m.opt.timestep - (time.time() - step_start)
-            if time_until_next_step > 0:
-                time.sleep(time_until_next_step)
+                # Rudimentary time keeping, will drift relative to wall clock.
+                time_until_next_step = m.opt.timestep - (time.time() - step_start)
+                if time_until_next_step > 0:
+                    time.sleep(time_until_next_step)
+    finally:
+        data_logger.save()
