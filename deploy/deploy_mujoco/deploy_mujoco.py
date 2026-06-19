@@ -50,9 +50,7 @@ PLATE_SERVO_FORCE_LIMIT = np.array(
     [10_000_000.0, 10_000_000.0, 10_000_000.0, 10_000_000.0, 10_000_000.0, 10_000_000.0]
 )
 SAGITTAL_AXIS = 0
-DEFAULT_ADAPTIVE_ANKLE_CONTROLLER_PATH = (
-    Path(LEGGED_GYM_ROOT_DIR).resolve().parent / "Digit_Mujoco" / "HighLevelCtrler" / "AccCtrler.py"
-)
+DEFAULT_ADAPTIVE_ANKLE_CONTROLLER_PATH = Path(__file__).resolve().parent / "adaptive_ankle_controller.py"
 ADAPTIVE_ANKLE_JOINT_NAMES = {
     "left": {
         "pitch": "left_ankle_pitch_joint",
