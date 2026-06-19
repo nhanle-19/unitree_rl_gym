@@ -116,6 +116,41 @@ def plot_com_tracking_map(save=True, show=False):
         plt.close(fig)
 
 
+def plot_ankle_torque(save=True, show=False):
+    t = load_dat("t", 1)[:, 0]
+    adaptive_tau = load_dat("adaptive_ankle_torque", 4)
+    applied_tau = load_dat("applied_ankle_torque", 4)
+    n = min(t.shape[0], adaptive_tau.shape[0], applied_tau.shape[0])
+    t = t[:n]
+    adaptive_tau = adaptive_tau[:n]
+    applied_tau = applied_tau[:n]
+
+    fig, axes = plt.subplots(4, 1, sharex=True, num="Ankle torque")
+    labels = (
+        "left ankle pitch",
+        "left ankle roll",
+        "right ankle pitch",
+        "right ankle roll",
+    )
+    for idx, ax in enumerate(axes):
+        ax.plot(t, applied_tau[:, idx], "-", label="applied total")
+        ax.plot(t, adaptive_tau[:, idx], "--", label="adaptive overlay")
+        ax.set_ylabel(f"{labels[idx]} [Nm]")
+        ax.grid(True, "both", "both")
+        ax.legend(loc="best")
+    axes[-1].set_xlabel("t [s]")
+    fig.tight_layout()
+
+    if save:
+        out = DATA_DIR / "ankle_torque.png"
+        fig.savefig(out, dpi=150)
+        print(f"Saved {out}")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
 def main():
     plots = (
         ("plate IMU plot", ("t", "plate_imu_acc"), plot_plate_imu),
@@ -125,6 +160,11 @@ def main():
             plot_com_velocity_tracking_error,
         ),
         ("COM tracking map", ("com_pos_plate_xy", "cmd_pos_xy"), plot_com_tracking_map),
+        (
+            "ankle torque plot",
+            ("t", "adaptive_ankle_torque", "applied_ankle_torque"),
+            plot_ankle_torque,
+        ),
     )
 
     for label, required, plot_fn in plots:

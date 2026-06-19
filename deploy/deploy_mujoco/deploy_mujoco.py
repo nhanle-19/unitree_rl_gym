@@ -302,9 +302,10 @@ def apply_plate_position_control(data, plate_addresses, plate_command):
 
 
 class PlateDataLogger:
-    def __init__(self, model, plate_addresses, output_dir=DATA_DIR):
+    def __init__(self, model, plate_addresses, num_actions, output_dir=DATA_DIR):
         self.output_dir = Path(output_dir)
         self.plate_addresses = plate_addresses
+        self.ankle_actuator_ids = self._get_ankle_actuator_ids(model, num_actions)
         self.robot_body_ids = get_robot_body_ids(model)
         self.robot_body_masses = model.body_mass[self.robot_body_ids].astype(np.float64)
         self.robot_body_mass = float(np.sum(self.robot_body_masses))
@@ -325,6 +326,8 @@ class PlateDataLogger:
         self.com_vel_plate = []
         self.cmd_vel = []
         self.com_vel_tracking_error = []
+        self.adaptive_ankle_torque = []
+        self.applied_ankle_torque = []
 
         self.plate_imu_acc_sid = mujoco.mj_name2id(
             model, mujoco.mjtObj.mjOBJ_SENSOR, PLATE_IMU_ACCEL_SENSOR
@@ -336,7 +339,7 @@ class PlateDataLogger:
             self.plate_imu_acc_adr = -1
             self.plate_imu_acc_dim = 0
 
-    def update(self, data, t, plate_command=None, cmd=None):
+    def update(self, data, t, plate_command=None, cmd=None, adaptive_tau=None, applied_tau=None):
         self.t.append([float(t)])
         self.plate_imu_acc.append(self._read_plate_imu_acc(data))
         com_pos = self._read_robot_com_position(data)
@@ -386,6 +389,8 @@ class PlateDataLogger:
         self.com_vel_plate.append(com_vel_plate)
         self.cmd_vel.append(cmd_vel)
         self.com_vel_tracking_error.append(tracking_error)
+        self.adaptive_ankle_torque.append(self._read_ankle_torque(adaptive_tau))
+        self.applied_ankle_torque.append(self._read_ankle_torque(applied_tau))
 
     def save(self):
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -399,7 +404,30 @@ class PlateDataLogger:
         self._save_array("com_vel_plate", self.com_vel_plate, 3)
         self._save_array("cmd_vel", self.cmd_vel, 2)
         self._save_array("com_vel_tracking_error", self.com_vel_tracking_error, 3)
+        self._save_array("adaptive_ankle_torque", self.adaptive_ankle_torque, 4)
+        self._save_array("applied_ankle_torque", self.applied_ankle_torque, 4)
         print(f"Saved MuJoCo deploy data to {self.output_dir}")
+
+    def _get_ankle_actuator_ids(self, model, num_actions):
+        ids = []
+        for side in ("left", "right"):
+            names = ADAPTIVE_ANKLE_JOINT_NAMES[side]
+            for joint_type in ("pitch", "roll"):
+                try:
+                    ids.append(get_actuator_id_for_joint(model, names[joint_type], num_actions))
+                except RuntimeError:
+                    ids.append(None)
+        return ids
+
+    def _read_ankle_torque(self, tau):
+        if tau is None:
+            return np.zeros(4, dtype=np.float32)
+        tau = np.asarray(tau, dtype=np.float32).reshape(-1)
+        ankle_tau = np.zeros(4, dtype=np.float32)
+        for idx, actuator_id in enumerate(self.ankle_actuator_ids):
+            if actuator_id is not None and actuator_id < tau.shape[0]:
+                ankle_tau[idx] = tau[actuator_id]
+        return ankle_tau
 
     def _read_plate_imu_acc(self, data):
         if self.plate_imu_acc_sid < 0 or self.plate_imu_acc_dim < 3:
@@ -711,7 +739,7 @@ if __name__ == "__main__":
     if plate_motion["enabled"]:
         apply_plate_state(d, plate_addresses, get_plate_command(0.0, plate_motion))
         mujoco.mj_forward(m, d)
-    data_logger = PlateDataLogger(m, plate_addresses)
+    data_logger = PlateDataLogger(m, plate_addresses, num_actions)
     adaptive_ankle = None
     if adaptive_ankle_enabled:
         adaptive_ankle = AdaptiveAnkleTorque(m, num_actions, simulation_dt, cmd, adaptive_ankle_config)
@@ -743,13 +771,15 @@ if __name__ == "__main__":
                     d.qvel[robot_dof_addr],
                     kds,
                 )
+                adaptive_tau = np.zeros(num_actions, dtype=np.float32)
                 if adaptive_ankle is not None:
-                    tau = tau + adaptive_ankle.compute(d, sim_time)
+                    adaptive_tau = adaptive_ankle.compute(d, sim_time)
+                    tau = tau + adaptive_tau
                 d.ctrl[:num_actions] = tau
                 # mj_step can be replaced with code that also evaluates
                 # a policy and applies a control signal before stepping the physics.
                 mujoco.mj_step(m, d)
-                data_logger.update(d, d.time, plate_command, cmd)
+                data_logger.update(d, d.time, plate_command, cmd, adaptive_tau, tau)
 
                 counter += 1
                 if counter % control_decimation == 0:
