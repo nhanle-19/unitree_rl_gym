@@ -1,4 +1,5 @@
 import time
+import importlib.util
 from pathlib import Path
 
 import mujoco.viewer
@@ -49,6 +50,21 @@ PLATE_SERVO_FORCE_LIMIT = np.array(
     [10_000_000.0, 10_000_000.0, 10_000_000.0, 10_000_000.0, 10_000_000.0, 10_000_000.0]
 )
 SAGITTAL_AXIS = 0
+DEFAULT_ADAPTIVE_ANKLE_CONTROLLER_PATH = (
+    Path(LEGGED_GYM_ROOT_DIR).resolve().parent / "Digit_Mujoco" / "HighLevelCtrler" / "AccCtrler.py"
+)
+ADAPTIVE_ANKLE_JOINT_NAMES = {
+    "left": {
+        "pitch": "left_ankle_pitch_joint",
+        "roll": "left_ankle_roll_joint",
+        "body": "left_ankle_roll_link",
+    },
+    "right": {
+        "pitch": "right_ankle_pitch_joint",
+        "roll": "right_ankle_roll_joint",
+        "body": "right_ankle_roll_link",
+    },
+}
 
 
 def get_actuated_joint_addresses(model, num_actions):
@@ -70,6 +86,38 @@ def get_actuated_joint_addresses(model, num_actions):
         dof_addr.append(dadr)
 
     return np.array(qpos_addr, dtype=np.int32), np.array(dof_addr, dtype=np.int32)
+
+
+def get_actuator_id_for_joint(model, joint_name, num_actions):
+    joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+    if joint_id == -1:
+        raise RuntimeError(f"Adaptive ankle mode requires joint {joint_name!r}")
+
+    for actuator_id in range(num_actions):
+        if int(model.actuator_trnid[actuator_id, 0]) == joint_id:
+            return actuator_id
+
+    raise RuntimeError(f"Adaptive ankle mode requires an actuator for joint {joint_name!r}")
+
+
+def get_body_id(model, body_name):
+    body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+    if body_id == -1:
+        raise RuntimeError(f"Adaptive ankle mode requires body {body_name!r}")
+    return int(body_id)
+
+
+def load_acc_high_controller(controller_path):
+    controller_path = Path(str(controller_path).replace("{LEGGED_GYM_ROOT_DIR}", LEGGED_GYM_ROOT_DIR)).expanduser()
+    if not controller_path.is_file():
+        raise FileNotFoundError(f"Adaptive ankle controller not found: {controller_path}")
+
+    spec = importlib.util.spec_from_file_location("digit_acc_controller", controller_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load adaptive ankle controller from {controller_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.AccHighController
 
 
 def load_viewer_camera(config):
@@ -403,12 +451,140 @@ class PlateDataLogger:
         np.savetxt(self.output_dir / f"{name}.dat", array)
 
 
+class AdaptiveAnkleTorque:
+    def __init__(self, model, num_actions, simulation_dt, cmd, config):
+        self.model = model
+        self.num_actions = num_actions
+        self.simulation_dt = simulation_dt
+        self.torque_scale = float(config.get("torque_scale", 1.0))
+        self.torque_limit = float(config.get("torque_limit", 50.0))
+        self.t_step = float(config.get("T_step", config.get("t_step", 0.4)))
+        if self.t_step <= 0.0:
+            raise ValueError("adaptive_ankle.T_step must be positive")
+
+        initial_stance = config.get("initial_stance", "left").lower()
+        if initial_stance not in ("left", "right"):
+            raise ValueError("adaptive_ankle.initial_stance must be 'left' or 'right'")
+
+        controller_path = config.get("controller_path", DEFAULT_ADAPTIVE_ANKLE_CONTROLLER_PATH)
+        AccHighController = load_acc_high_controller(controller_path)
+        mass = float(config.get("mass", self._get_robot_mass()))
+        self.controller = AccHighController(
+            CtrlFreq=int(round(1.0 / simulation_dt)),
+            z_sc_d_set=float(config.get("z_sc_d", 0.8)),
+            T_step_set=self.t_step,
+            vx_des_set=float(config.get("vx_des", cmd[0])),
+            vy_des_set=float(config.get("vy_des", cmd[1])),
+            width_des_set=float(config.get("width_des", 0.15)),
+            mass_set=mass,
+        )
+        self.controller.set_ankle_PD_gain()
+
+        self.actuator_ids = {}
+        self.body_ids = {}
+        for side, names in ADAPTIVE_ANKLE_JOINT_NAMES.items():
+            self.actuator_ids[(side, "pitch")] = get_actuator_id_for_joint(model, names["pitch"], num_actions)
+            self.actuator_ids[(side, "roll")] = get_actuator_id_for_joint(model, names["roll"], num_actions)
+            self.body_ids[side] = get_body_id(model, names["body"])
+
+        self.robot_body_ids = get_robot_body_ids(model)
+        self.robot_body_masses = model.body_mass[self.robot_body_ids].astype(np.float64)
+        self.robot_body_mass = float(np.sum(self.robot_body_masses))
+        self.i_stance = 1 if initial_stance == "left" else 2
+        self.stance_side = initial_stance
+        self.current_tk = 0.0
+        self.prev_t = None
+        self.prev_sc_pos = None
+
+        self.cmd_coeff_x = self.controller.solve_for_coeffs_from_ic(0.0, 0.0, 0.0)
+        self.cmd_coeff_x_next, self.cmd_step_x = self.controller.update_commanded_profile_coeffs(self.cmd_coeff_x)
+        self.cmd_coeff_y = self.controller.solve_for_coeffs_from_ic_y(0.0, 0.0, 0.0)
+        self.cmd_coeff_y_next, self.cmd_step_y = self.controller.update_commanded_profile_coeffs_y(
+            self.i_stance, self.cmd_coeff_y
+        )
+        self.controller.update_coeff_for_current_step(
+            self.cmd_coeff_x,
+            self.cmd_coeff_y,
+            self.current_tk,
+            self.cmd_step_x,
+            self.cmd_step_y,
+        )
+
+    def compute(self, data, t):
+        self._advance_steps(t)
+        x_sc, vx_sc, y_sc, vy_sc = self._read_stance_com_state(data, t)
+        tau_x, tau_y = self.controller.get_ankle_torque(t, x_sc, vx_sc, y_sc, vy_sc)
+
+        adaptive_tau = np.zeros(self.num_actions, dtype=np.float32)
+        adaptive_tau[self.actuator_ids[(self.stance_side, "roll")]] = tau_x
+        adaptive_tau[self.actuator_ids[(self.stance_side, "pitch")]] = tau_y
+        return np.clip(self.torque_scale * adaptive_tau, -self.torque_limit, self.torque_limit)
+
+    def _advance_steps(self, t):
+        while t - self.current_tk >= self.t_step:
+            self.current_tk += self.t_step
+            self.i_stance = 2 if self.i_stance == 1 else 1
+            self.stance_side = "left" if self.i_stance == 1 else "right"
+
+            cmd_coeff_x_next_next, cmd_step_x_new = self.controller.update_commanded_profile_coeffs(
+                self.cmd_coeff_x_next
+            )
+            cmd_coeff_y_next_next, cmd_step_y_new = self.controller.update_commanded_profile_coeffs_y(
+                self.i_stance, self.cmd_coeff_y_next
+            )
+            self.cmd_coeff_x = self.cmd_coeff_x_next
+            self.cmd_coeff_y = self.cmd_coeff_y_next
+            self.cmd_coeff_x_next = cmd_coeff_x_next_next
+            self.cmd_coeff_y_next = cmd_coeff_y_next_next
+            self.controller.update_coeff_for_current_step(
+                self.cmd_coeff_x,
+                self.cmd_coeff_y,
+                self.current_tk,
+                cmd_step_x_new,
+                cmd_step_y_new,
+            )
+            self.prev_t = None
+            self.prev_sc_pos = None
+
+    def _read_stance_com_state(self, data, t):
+        com_pos = self._read_robot_com_position(data)
+        stance_pos = np.asarray(data.xpos[self.body_ids[self.stance_side]], dtype=np.float64)
+        sc_pos = com_pos - stance_pos
+
+        if self.prev_t is None:
+            sc_vel = np.zeros(3, dtype=np.float64)
+        else:
+            dt = float(t) - self.prev_t
+            if dt <= 0.0:
+                sc_vel = np.zeros(3, dtype=np.float64)
+            else:
+                sc_vel = (sc_pos - self.prev_sc_pos) / dt
+
+        self.prev_t = float(t)
+        self.prev_sc_pos = sc_pos.copy()
+        return float(sc_pos[0]), float(sc_vel[0]), float(sc_pos[1]), float(sc_vel[1])
+
+    def _read_robot_com_position(self, data):
+        body_com_positions = data.xipos[self.robot_body_ids]
+        return np.sum(body_com_positions * self.robot_body_masses[:, None], axis=0) / self.robot_body_mass
+
+    def _get_robot_mass(self):
+        body_ids = get_robot_body_ids(self.model)
+        return float(np.sum(self.model.body_mass[body_ids]))
+
+
 if __name__ == "__main__":
     # get config file name from command line
     import argparse
 
     parser = argparse.ArgumentParser()
     parser.add_argument("config_file", type=str, help="config file name in the config folder")
+    parser.add_argument(
+        "--adaptive-ankle",
+        "--adaptive_ankle",
+        action="store_true",
+        help="walk with adaptive stance ankle torque added on top of the policy PD torque",
+    )
     args = parser.parse_args()
     config_file = args.config_file
     with open(f"{LEGGED_GYM_ROOT_DIR}/deploy/deploy_mujoco/configs/{config_file}", "r") as f:
@@ -437,6 +613,8 @@ if __name__ == "__main__":
         cmd = np.array(config["cmd_init"], dtype=np.float32)
         plate_motion = load_plate_motion(config)
         viewer_camera = load_viewer_camera(config)
+        adaptive_ankle_config = config.get("adaptive_ankle", {})
+        adaptive_ankle_enabled = args.adaptive_ankle or bool(adaptive_ankle_config.get("enabled", False))
 
     # define context variables
     action = np.zeros(num_actions, dtype=np.float32)
@@ -455,6 +633,10 @@ if __name__ == "__main__":
         apply_plate_state(d, plate_addresses, get_plate_command(0.0, plate_motion))
         mujoco.mj_forward(m, d)
     data_logger = PlateDataLogger(m, plate_addresses)
+    adaptive_ankle = None
+    if adaptive_ankle_enabled:
+        adaptive_ankle = AdaptiveAnkleTorque(m, num_actions, simulation_dt, cmd, adaptive_ankle_config)
+        print("Adaptive ankle mode enabled.")
 
     # load policy
     policy = torch.jit.load(policy_path)
@@ -481,6 +663,8 @@ if __name__ == "__main__":
                     d.qvel[robot_dof_addr],
                     kds,
                 )
+                if adaptive_ankle is not None:
+                    tau = tau + adaptive_ankle.compute(d, sim_time)
                 d.ctrl[:num_actions] = tau
                 # mj_step can be replaced with code that also evaluates
                 # a policy and applies a control signal before stepping the physics.
