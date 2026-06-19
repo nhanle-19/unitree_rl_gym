@@ -454,15 +454,21 @@ class AdaptiveAnkleTorque:
         self.model = model
         self.num_actions = num_actions
         self.simulation_dt = simulation_dt
-        self.torque_scale = float(config.get("torque_scale", 1.0))
-        self.torque_limit = float(config.get("torque_limit", 50.0))
+        self.torque_scale = float(config.get("torque_scale", 0.2))
+        self.torque_limit = float(config.get("torque_limit", 20.0))
+        self.roll_sign = float(config.get("roll_sign", 1.0))
+        self.pitch_sign = float(config.get("pitch_sign", 1.0))
+        self.stance_mode = config.get("stance_mode", "contact").lower()
+        self.min_step_time = float(config.get("min_step_time", 0.15))
         self.t_step = float(config.get("T_step", config.get("t_step", 0.4)))
         if self.t_step <= 0.0:
             raise ValueError("adaptive_ankle.T_step must be positive")
 
-        initial_stance = config.get("initial_stance", "left").lower()
-        if initial_stance not in ("left", "right"):
-            raise ValueError("adaptive_ankle.initial_stance must be 'left' or 'right'")
+        initial_stance = config.get("initial_stance", "auto").lower()
+        if initial_stance not in ("auto", "left", "right"):
+            raise ValueError("adaptive_ankle.initial_stance must be 'auto', 'left', or 'right'")
+        if self.stance_mode not in ("contact", "time"):
+            raise ValueError("adaptive_ankle.stance_mode must be 'contact' or 'time'")
 
         controller_path = config.get("controller_path", DEFAULT_ADAPTIVE_ANKLE_CONTROLLER_PATH)
         AccHighController = load_acc_high_controller(controller_path)
@@ -485,11 +491,13 @@ class AdaptiveAnkleTorque:
             self.actuator_ids[(side, "roll")] = get_actuator_id_for_joint(model, names["roll"], num_actions)
             self.body_ids[side] = get_body_id(model, names["body"])
 
+        self.base_body_id = get_base_body_id(model)
         self.robot_body_ids = get_robot_body_ids(model)
         self.robot_body_masses = model.body_mass[self.robot_body_ids].astype(np.float64)
         self.robot_body_mass = float(np.sum(self.robot_body_masses))
-        self.i_stance = 1 if initial_stance == "left" else 2
-        self.stance_side = initial_stance
+        self.i_stance = 1
+        self.stance_side = "left"
+        self.initial_stance = initial_stance
         self.current_tk = 0.0
         self.prev_t = None
         self.prev_sc_pos = None
@@ -509,45 +517,84 @@ class AdaptiveAnkleTorque:
         )
 
     def compute(self, data, t):
-        self._advance_steps(t)
+        self._update_stance(data, t)
         x_sc, vx_sc, y_sc, vy_sc = self._read_stance_com_state(data, t)
         tau_x, tau_y = self.controller.get_ankle_torque(t, x_sc, vx_sc, y_sc, vy_sc)
 
         adaptive_tau = np.zeros(self.num_actions, dtype=np.float32)
-        adaptive_tau[self.actuator_ids[(self.stance_side, "roll")]] = tau_x
-        adaptive_tau[self.actuator_ids[(self.stance_side, "pitch")]] = tau_y
+        adaptive_tau[self.actuator_ids[(self.stance_side, "roll")]] = self.roll_sign * tau_x
+        adaptive_tau[self.actuator_ids[(self.stance_side, "pitch")]] = self.pitch_sign * tau_y
         return np.clip(self.torque_scale * adaptive_tau, -self.torque_limit, self.torque_limit)
 
-    def _advance_steps(self, t):
-        while t - self.current_tk >= self.t_step:
-            self.current_tk += self.t_step
-            self.i_stance = 2 if self.i_stance == 1 else 1
-            self.stance_side = "left" if self.i_stance == 1 else "right"
+    def initialize(self, data, t=0.0):
+        detected_stance = self._detect_stance_side(data)
+        if self.initial_stance in ("left", "right"):
+            self.stance_side = self.initial_stance
+        elif detected_stance is not None:
+            self.stance_side = detected_stance
+        else:
+            self.stance_side = self._lowest_foot_side(data)
+        self.i_stance = 1 if self.stance_side == "left" else 2
+        self.current_tk = float(t)
 
-            cmd_coeff_x_next_next, cmd_step_x_new = self.controller.update_commanded_profile_coeffs(
-                self.cmd_coeff_x_next
-            )
-            cmd_coeff_y_next_next, cmd_step_y_new = self.controller.update_commanded_profile_coeffs_y(
-                self.i_stance, self.cmd_coeff_y_next
-            )
-            self.cmd_coeff_x = self.cmd_coeff_x_next
-            self.cmd_coeff_y = self.cmd_coeff_y_next
-            self.cmd_coeff_x_next = cmd_coeff_x_next_next
-            self.cmd_coeff_y_next = cmd_coeff_y_next_next
-            self.controller.update_coeff_for_current_step(
-                self.cmd_coeff_x,
-                self.cmd_coeff_y,
-                self.current_tk,
-                cmd_step_x_new,
-                cmd_step_y_new,
-            )
-            self.prev_t = None
-            self.prev_sc_pos = None
+        x_sc, _, y_sc, _ = self._read_stance_com_state(data, t)
+        self.cmd_coeff_x = self.controller.solve_for_coeffs_from_ic(x_sc, 0.0, 0.0)
+        self.cmd_coeff_x_next, self.cmd_step_x = self.controller.update_commanded_profile_coeffs(self.cmd_coeff_x)
+        self.cmd_coeff_y = self.controller.solve_for_coeffs_from_ic_y(y_sc, 0.0, 0.0)
+        self.cmd_coeff_y_next, self.cmd_step_y = self.controller.update_commanded_profile_coeffs_y(
+            self.i_stance, self.cmd_coeff_y
+        )
+        self.controller.update_coeff_for_current_step(
+            self.cmd_coeff_x,
+            self.cmd_coeff_y,
+            self.current_tk,
+            self.cmd_step_x,
+            self.cmd_step_y,
+        )
+        self.prev_t = None
+        self.prev_sc_pos = None
+
+    def _update_stance(self, data, t):
+        if self.stance_mode == "contact":
+            detected_stance = self._detect_stance_side(data)
+            if detected_stance is not None:
+                if detected_stance != self.stance_side and t - self.current_tk >= self.min_step_time:
+                    self._switch_stance(detected_stance, t)
+                return
+
+        while t - self.current_tk >= self.t_step:
+            next_side = "right" if self.stance_side == "left" else "left"
+            self._switch_stance(next_side, self.current_tk + self.t_step)
+
+    def _switch_stance(self, next_side, t):
+        self.stance_side = next_side
+        self.i_stance = 1 if next_side == "left" else 2
+        self.current_tk = float(t)
+
+        cmd_coeff_x_next_next, cmd_step_x_new = self.controller.update_commanded_profile_coeffs(
+            self.cmd_coeff_x_next
+        )
+        cmd_coeff_y_next_next, cmd_step_y_new = self.controller.update_commanded_profile_coeffs_y(
+            self.i_stance, self.cmd_coeff_y_next
+        )
+        self.cmd_coeff_x = self.cmd_coeff_x_next
+        self.cmd_coeff_y = self.cmd_coeff_y_next
+        self.cmd_coeff_x_next = cmd_coeff_x_next_next
+        self.cmd_coeff_y_next = cmd_coeff_y_next_next
+        self.controller.update_coeff_for_current_step(
+            self.cmd_coeff_x,
+            self.cmd_coeff_y,
+            self.current_tk,
+            cmd_step_x_new,
+            cmd_step_y_new,
+        )
+        self.prev_t = None
+        self.prev_sc_pos = None
 
     def _read_stance_com_state(self, data, t):
         com_pos = self._read_robot_com_position(data)
         stance_pos = np.asarray(data.xpos[self.body_ids[self.stance_side]], dtype=np.float64)
-        sc_pos = com_pos - stance_pos
+        sc_pos = self._to_base_yaw_frame(data, com_pos - stance_pos)
 
         if self.prev_t is None:
             sc_vel = np.zeros(3, dtype=np.float64)
@@ -561,6 +608,40 @@ class AdaptiveAnkleTorque:
         self.prev_t = float(t)
         self.prev_sc_pos = sc_pos.copy()
         return float(sc_pos[0]), float(sc_vel[0]), float(sc_pos[1]), float(sc_vel[1])
+
+    def _detect_stance_side(self, data):
+        contact_counts = {"left": 0, "right": 0}
+        for contact_id in range(data.ncon):
+            contact = data.contact[contact_id]
+            body_1 = int(self.model.geom_bodyid[contact.geom1])
+            body_2 = int(self.model.geom_bodyid[contact.geom2])
+            for side, body_id in self.body_ids.items():
+                if body_1 == body_id or body_2 == body_id:
+                    contact_counts[side] += 1
+
+        left_contacts = contact_counts["left"]
+        right_contacts = contact_counts["right"]
+        if left_contacts > 0 and right_contacts == 0:
+            return "left"
+        if right_contacts > 0 and left_contacts == 0:
+            return "right"
+        return None
+
+    def _lowest_foot_side(self, data):
+        left_z = float(data.xpos[self.body_ids["left"]][2])
+        right_z = float(data.xpos[self.body_ids["right"]][2])
+        return "left" if left_z <= right_z else "right"
+
+    def _to_base_yaw_frame(self, data, vector_world):
+        base_rot = np.asarray(data.xmat[self.base_body_id], dtype=np.float64).reshape(3, 3)
+        forward = base_rot[:, 0].copy()
+        forward[2] = 0.0
+        norm = np.linalg.norm(forward[:2])
+        if norm < 1e-6:
+            return vector_world
+        forward /= norm
+        left = np.array([-forward[1], forward[0], 0.0], dtype=np.float64)
+        return np.array([np.dot(vector_world, forward), np.dot(vector_world, left), vector_world[2]])
 
     def _read_robot_com_position(self, data):
         body_com_positions = data.xipos[self.robot_body_ids]
@@ -634,6 +715,7 @@ if __name__ == "__main__":
     adaptive_ankle = None
     if adaptive_ankle_enabled:
         adaptive_ankle = AdaptiveAnkleTorque(m, num_actions, simulation_dt, cmd, adaptive_ankle_config)
+        adaptive_ankle.initialize(d)
         print("Adaptive ankle mode enabled.")
 
     # load policy

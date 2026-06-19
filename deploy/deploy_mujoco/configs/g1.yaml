@@ -27,13 +27,17 @@ cmd_init: [0.5, 0, 0]
 
 adaptive_ankle:
   enabled: false
-  controller_path: "{LEGGED_GYM_ROOT_DIR}/deploy/deploy_mujoco/adaptive_ankle_controller.py"
+  controller_path: "{LEGGED_GYM_ROOT_DIR}/unitree_rl_gym/deploy/deploy_mujoco/adaptive_ankle_controller.py"
   T_step: 0.4
   z_sc_d: 0.8
   width_des: 0.15
-  initial_stance: "left"
-  torque_scale: 1.0
-  torque_limit: 50.0
+  initial_stance: "auto"
+  stance_mode: "contact"
+  min_step_time: 0.15
+  roll_sign: 1.0
+  pitch_sign: 1.0
+  torque_scale: 0.2
+  torque_limit: 20.0
 
 viewer_camera:
   track_base: true
