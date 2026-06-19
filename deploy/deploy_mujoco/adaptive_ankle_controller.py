@@ -3,11 +3,11 @@ import numpy as np
 
 ANKLE_GAIN = {
     "grav_x": 0.0,
-    "kp_x": 35.0,
-    "kd_x": 13.0,
+    "kp_x": 12.0,
+    "kd_x": 4.0,
     "grav_y": 0.0,
-    "kp_y": 25.0,
-    "kd_y": 10.0,
+    "kp_y": 8.0,
+    "kd_y": 3.0,
 }
 
 
