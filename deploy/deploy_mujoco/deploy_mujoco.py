@@ -554,14 +554,6 @@ class AdaptiveAnkleTorque:
         adaptive_tau[self.actuator_ids[(self.stance_side, "pitch")]] = self.pitch_sign * tau_y
         return np.clip(self.torque_scale * adaptive_tau, -self.torque_limit, self.torque_limit)
 
-    def ankle_actuator_ids(self):
-        return [
-            self.actuator_ids[("left", "pitch")],
-            self.actuator_ids[("left", "roll")],
-            self.actuator_ids[("right", "pitch")],
-            self.actuator_ids[("right", "roll")],
-        ]
-
     def initialize(self, data, t=0.0):
         detected_stance = self._detect_stance_side(data)
         if self.initial_stance in ("left", "right"):
@@ -782,8 +774,7 @@ if __name__ == "__main__":
                 adaptive_tau = np.zeros(num_actions, dtype=np.float32)
                 if adaptive_ankle is not None:
                     adaptive_tau = adaptive_ankle.compute(d, sim_time)
-                    ankle_actuator_ids = adaptive_ankle.ankle_actuator_ids()
-                    tau[ankle_actuator_ids] = adaptive_tau[ankle_actuator_ids]
+                    tau = tau + adaptive_tau
                 d.ctrl[:num_actions] = tau
                 # mj_step can be replaced with code that also evaluates
                 # a policy and applies a control signal before stepping the physics.
