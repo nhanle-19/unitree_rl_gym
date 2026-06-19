@@ -1,5 +1,4 @@
 from pathlib import Path
-import argparse
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -87,27 +86,53 @@ def plot_com_velocity_tracking_error(save=True, show=False):
         plt.close(fig)
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--show", action="store_true", help="Show the matplotlib window after saving the plot")
-    parser.add_argument("--no-save", action="store_true", help="Do not save the PNG plot")
-    parser.add_argument(
-        "--plot",
-        choices=("all", "plate-imu", "com-velocity-tracking"),
-        default="all",
-        help="Select which plot to generate",
-    )
-    args = parser.parse_args()
+def plot_com_tracking_map(save=True, show=False):
+    com_xy = load_dat("com_pos_plate_xy", 2)
+    cmd_xy = load_dat("cmd_pos_xy", 2)
+    n = min(com_xy.shape[0], cmd_xy.shape[0])
+    com_xy = com_xy[:n]
+    cmd_xy = cmd_xy[:n]
 
-    if args.plot in ("all", "plate-imu"):
-        plot_plate_imu(save=not args.no_save, show=args.show)
-    if args.plot in ("all", "com-velocity-tracking"):
-        required = ("com_vel_plate", "cmd_vel", "com_vel_tracking_error")
+    fig, ax = plt.subplots(num="COM tracking map")
+    ax.plot(cmd_xy[:, 0], cmd_xy[:, 1], "--", label="cmd xy")
+    ax.plot(com_xy[:, 0], com_xy[:, 1], "-", label="COM xy in plate frame")
+    if n > 0:
+        ax.plot(com_xy[0, 0], com_xy[0, 1], "go", label="start")
+        ax.plot(com_xy[-1, 0], com_xy[-1, 1], "ro", label="end")
+    ax.set_xlabel("x [m]")
+    ax.set_ylabel("y [m]")
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, "both", "both")
+    ax.legend(loc="best")
+    fig.tight_layout()
+
+    if save:
+        out = DATA_DIR / "com_tracking_map_xy.png"
+        fig.savefig(out, dpi=150)
+        print(f"Saved {out}")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
+def main():
+    plots = (
+        ("plate IMU plot", ("t", "plate_imu_acc"), plot_plate_imu),
+        (
+            "COM velocity tracking plot",
+            ("t", "com_vel_plate", "cmd_vel", "com_vel_tracking_error"),
+            plot_com_velocity_tracking_error,
+        ),
+        ("COM tracking map", ("com_pos_plate_xy", "cmd_pos_xy"), plot_com_tracking_map),
+    )
+
+    for label, required, plot_fn in plots:
         if all(has_dat(name) for name in required):
-            plot_com_velocity_tracking_error(save=not args.no_save, show=args.show)
+            plot_fn()
         else:
             missing = ", ".join(f"{name}.dat" for name in required if not has_dat(name))
-            print(f"Skipping COM velocity tracking plot; missing {missing}. Run deploy_mujoco.py first.")
+            print(f"Skipping {label}; missing {missing}. Run deploy_mujoco.py first.")
 
 
 if __name__ == "__main__":

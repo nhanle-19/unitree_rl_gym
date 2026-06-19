@@ -99,6 +99,9 @@ deploy/deploy_mujoco/data/plate_imu_acc.dat
 The deploy run also logs COM velocity tracking data in the plate frame:
 
 ```text
+deploy/deploy_mujoco/data/com_pos_plate_xy.dat
+deploy/deploy_mujoco/data/cmd_pos_xy.dat
+deploy/deploy_mujoco/data/com_pos_tracking_error.dat
 deploy/deploy_mujoco/data/com_vel_plate.dat
 deploy/deploy_mujoco/data/cmd_vel.dat
 deploy/deploy_mujoco/data/com_vel_tracking_error.dat
@@ -114,10 +117,9 @@ This saves:
 
 ```text
 deploy/deploy_mujoco/data/plate_imu_acc.png
+deploy/deploy_mujoco/data/com_tracking_map_xy.png
 deploy/deploy_mujoco/data/com_velocity_tracking_error.png
 ```
-
-Use `--plot com-velocity-tracking` to generate only the COM velocity tracking plot, and use `--show` to also open the matplotlib window.
 
 ## Notes
 

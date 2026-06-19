@@ -266,11 +266,16 @@ class PlateDataLogger:
         self.prev_t = None
         self.prev_com_pos = None
         self.prev_plate_pos = None
+        self.initial_com_pos_plate = None
+        self.cmd_pos_xy = np.zeros(2, dtype=np.float64)
 
         self.t = []
         self.plate_imu_acc = []
         self.drs_des = []
         self.drs_act = []
+        self.com_pos_plate_xy = []
+        self.cmd_pos_xy_log = []
+        self.com_pos_tracking_error = []
         self.com_vel_plate = []
         self.cmd_vel = []
         self.com_vel_tracking_error = []
@@ -288,7 +293,12 @@ class PlateDataLogger:
     def update(self, data, t, plate_command=None, cmd=None):
         self.t.append([float(t)])
         self.plate_imu_acc.append(self._read_plate_imu_acc(data))
-        com_vel_plate = self._read_com_velocity_in_plate_frame(data, t)
+        com_pos = self._read_robot_com_position(data)
+        plate_pos, plate_rot = self._read_plate_pose(data)
+        com_pos_plate = self._to_plate_frame(com_pos, plate_pos, plate_rot)
+        com_vel_plate, dt = self._read_com_velocity_in_plate_frame(
+            com_pos, plate_pos, plate_rot, t
+        )
 
         if plate_command is None:
             plate_command = np.zeros(len(PLATE_JOINT_ORDER), dtype=np.float32)
@@ -305,11 +315,28 @@ class PlateDataLogger:
             cmd_vel = np.zeros(2, dtype=np.float32)
         else:
             cmd_vel = np.asarray(cmd, dtype=np.float32).reshape(-1)[:2]
+
+        if self.initial_com_pos_plate is None:
+            self.initial_com_pos_plate = com_pos_plate.copy()
+        if dt > 0.0:
+            self.cmd_pos_xy += cmd_vel.astype(np.float64) * dt
+
+        com_pos_xy = (com_pos_plate[:2] - self.initial_com_pos_plate[:2]).astype(np.float32)
+        cmd_pos_xy = self.cmd_pos_xy.astype(np.float32)
+        pos_error_xy = cmd_pos_xy - com_pos_xy
+        pos_error = np.array(
+            [pos_error_xy[0], pos_error_xy[1], np.linalg.norm(pos_error_xy)],
+            dtype=np.float32,
+        )
+
         tracking_error_xy = cmd_vel - com_vel_plate[:2]
         tracking_error = np.array(
             [tracking_error_xy[0], tracking_error_xy[1], np.linalg.norm(tracking_error_xy)],
             dtype=np.float32,
         )
+        self.com_pos_plate_xy.append(com_pos_xy)
+        self.cmd_pos_xy_log.append(cmd_pos_xy)
+        self.com_pos_tracking_error.append(pos_error)
         self.com_vel_plate.append(com_vel_plate)
         self.cmd_vel.append(cmd_vel)
         self.com_vel_tracking_error.append(tracking_error)
@@ -320,6 +347,9 @@ class PlateDataLogger:
         self._save_array("plate_imu_acc", self.plate_imu_acc, 3)
         self._save_array("drs_des", self.drs_des, len(PLATE_JOINT_ORDER))
         self._save_array("drs_act", self.drs_act, len(PLATE_JOINT_ORDER))
+        self._save_array("com_pos_plate_xy", self.com_pos_plate_xy, 2)
+        self._save_array("cmd_pos_xy", self.cmd_pos_xy_log, 2)
+        self._save_array("com_pos_tracking_error", self.com_pos_tracking_error, 3)
         self._save_array("com_vel_plate", self.com_vel_plate, 3)
         self._save_array("cmd_vel", self.cmd_vel, 2)
         self._save_array("com_vel_tracking_error", self.com_vel_tracking_error, 3)
@@ -331,16 +361,15 @@ class PlateDataLogger:
         acc = data.sensordata[self.plate_imu_acc_adr : self.plate_imu_acc_adr + 3]
         return np.asarray(acc, dtype=np.float32).reshape(3)
 
-    def _read_com_velocity_in_plate_frame(self, data, t):
-        com_pos = self._read_robot_com_position(data)
-        plate_pos, plate_rot = self._read_plate_pose(data)
-
+    def _read_com_velocity_in_plate_frame(self, com_pos, plate_pos, plate_rot, t):
         if self.prev_t is None:
             com_vel_plate = np.zeros(3, dtype=np.float32)
+            dt = 0.0
         else:
             dt = float(t) - self.prev_t
             if dt <= 0.0:
                 com_vel_plate = np.zeros(3, dtype=np.float32)
+                dt = 0.0
             else:
                 com_vel_world = (com_pos - self.prev_com_pos) / dt
                 plate_vel_world = (plate_pos - self.prev_plate_pos) / dt
@@ -350,7 +379,7 @@ class PlateDataLogger:
         self.prev_t = float(t)
         self.prev_com_pos = com_pos
         self.prev_plate_pos = plate_pos
-        return com_vel_plate
+        return com_vel_plate, dt
 
     def _read_robot_com_position(self, data):
         body_com_positions = data.xipos[self.robot_body_ids]
@@ -362,6 +391,9 @@ class PlateDataLogger:
         plate_pos = np.asarray(data.xpos[self.plate_body_id], dtype=np.float64)
         plate_rot = np.asarray(data.xmat[self.plate_body_id], dtype=np.float64).reshape(3, 3)
         return plate_pos, plate_rot
+
+    def _to_plate_frame(self, pos_world, plate_pos, plate_rot):
+        return plate_rot.T @ (pos_world - plate_pos)
 
     def _save_array(self, name, values, width):
         if values:
